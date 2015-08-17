@@ -19,22 +19,28 @@
 #  -e GPG_PASSPHRASE=gloubiboulga \
 #  docker hack/release.sh
 #
-# Note: Apparmor used to mess with privileged mode, but this is no longer
+# Note: AppArmor used to mess with privileged mode, but this is no longer
 # the case. Therefore, you don't have to disable it anymore.
 #
 
 FROM ubuntu:14.04
 MAINTAINER Tianon Gravi <admwiggin@gmail.com> (@tianon)
 
+RUN	apt-key adv --keyserver hkp://p80.pool.sks-keyservers.net:80 --recv-keys E871F18B51E0147C77796AC81196BA81F6B0FC61
+RUN	echo deb http://ppa.launchpad.net/zfs-native/stable/ubuntu trusty main > /etc/apt/sources.list.d/zfs.list
+
 # Packaged dependencies
 RUN apt-get update && apt-get install -y \
 	apparmor \
 	aufs-tools \
 	automake \
+	bash-completion \
 	btrfs-tools \
 	build-essential \
+	createrepo \
 	curl \
 	dpkg-sig \
+	gcc-mingw-w64 \
 	git \
 	iptables \
 	libapparmor-dev \
@@ -49,6 +55,8 @@ RUN apt-get update && apt-get install -y \
 	ruby1.9.1 \
 	ruby1.9.1-dev \
 	s3cmd=1.1.0* \
+	ubuntu-zfs \
+	libzfs-dev \
 	--no-install-recommends
 
 # Get lvm2 source for compiling statically
@@ -63,7 +71,7 @@ RUN cd /usr/local/lvm2 \
 # see https://git.fedorahosted.org/cgit/lvm2.git/tree/INSTALL
 
 # Install lxc
-ENV LXC_VERSION 1.0.7
+ENV LXC_VERSION 1.1.2
 RUN mkdir -p /usr/src/lxc \
 	&& curl -sSL https://linuxcontainers.org/downloads/lxc/lxc-${LXC_VERSION}.tar.gz | tar -v -C /usr/src/lxc/ -xz --strip-components=1
 RUN cd /usr/src/lxc \
@@ -97,26 +105,50 @@ RUN cd /usr/local/go/src \
 			./make.bash --no-clean 2>&1; \
 	done
 
-# We still support compiling with older Go, so need to grab older "gofmt"
-ENV GOFMT_VERSION 1.3.3
-RUN curl -sSL https://storage.googleapis.com/golang/go${GOFMT_VERSION}.$(go env GOOS)-$(go env GOARCH).tar.gz | tar -C /go/bin -xz --strip-components=2 go/bin/gofmt
+# This has been commented out and kept as reference because we don't support compiling with older Go anymore.
+# ENV GOFMT_VERSION 1.3.3
+# RUN curl -sSL https://storage.googleapis.com/golang/go${GOFMT_VERSION}.$(go env GOOS)-$(go env GOARCH).tar.gz | tar -C /go/bin -xz --strip-components=2 go/bin/gofmt
 
+# Update this sha when we upgrade to go 1.5.0
+ENV GO_TOOLS_COMMIT 069d2f3bcb68257b627205f0486d6cc69a231ff9
 # Grab Go's cover tool for dead-simple code coverage testing
-RUN go get golang.org/x/tools/cmd/cover
+# Grab Go's vet tool for examining go code to find suspicious constructs
+# and help prevent errors that the compiler might not catch
+RUN git clone https://github.com/golang/tools.git /go/src/golang.org/x/tools \
+	&& (cd /go/src/golang.org/x/tools && git checkout -q $GO_TOOLS_COMMIT) \
+	&& go install -v golang.org/x/tools/cmd/cover \
+	&& go install -v golang.org/x/tools/cmd/vet
+# Grab Go's lint tool
+ENV GO_LINT_COMMIT f42f5c1c440621302702cb0741e9d2ca547ae80f
+RUN git clone https://github.com/golang/lint.git /go/src/github.com/golang/lint \
+	&& (cd /go/src/github.com/golang/lint && git checkout -q $GO_LINT_COMMIT) \
+	&& go install -v github.com/golang/lint/golint
 
 # TODO replace FPM with some very minimal debhelper stuff
 RUN gem install --no-rdoc --no-ri fpm --version 1.3.2
 
 # Install registry
-ENV REGISTRY_COMMIT d957768537c5af40e4f4cd96871f7b2bde9e2923
+ENV REGISTRY_COMMIT 2317f721a3d8428215a2b65da4ae85212ed473b4
 RUN set -x \
-	&& git clone https://github.com/docker/distribution.git /go/src/github.com/docker/distribution \
-	&& (cd /go/src/github.com/docker/distribution && git checkout -q $REGISTRY_COMMIT) \
-	&& GOPATH=/go/src/github.com/docker/distribution/Godeps/_workspace:/go \
-		go build -o /go/bin/registry-v2 github.com/docker/distribution/cmd/registry
+	&& export GOPATH="$(mktemp -d)" \
+	&& git clone https://github.com/docker/distribution.git "$GOPATH/src/github.com/docker/distribution" \
+	&& (cd "$GOPATH/src/github.com/docker/distribution" && git checkout -q "$REGISTRY_COMMIT") \
+	&& GOPATH="$GOPATH/src/github.com/docker/distribution/Godeps/_workspace:$GOPATH" \
+		go build -o /usr/local/bin/registry-v2 github.com/docker/distribution/cmd/registry \
+	&& rm -rf "$GOPATH"
+
+# Install notary server
+ENV NOTARY_COMMIT 8e8122eb5528f621afcd4e2854c47302f17392f7
+RUN set -x \
+	&& export GOPATH="$(mktemp -d)" \
+	&& git clone https://github.com/docker/notary.git "$GOPATH/src/github.com/docker/notary" \
+	&& (cd "$GOPATH/src/github.com/docker/notary" && git checkout -q "$NOTARY_COMMIT") \
+	&& GOPATH="$GOPATH/src/github.com/docker/notary/Godeps/_workspace:$GOPATH" \
+		go build -o /usr/local/bin/notary-server github.com/docker/notary/cmd/notary-server \
+	&& rm -rf "$GOPATH"
 
 # Get the "docker-py" source so we can run their integration tests
-ENV DOCKER_PY_COMMIT 91985b239764fe54714fa0a93d52aa362357d251
+ENV DOCKER_PY_COMMIT 139850f3f3b17357bab5ba3edfb745fb14043764
 RUN git clone https://github.com/docker/docker-py.git /docker-py \
 	&& cd /docker-py \
 	&& git checkout -q $DOCKER_PY_COMMIT
@@ -137,32 +169,47 @@ RUN useradd --create-home --gid docker unprivilegeduser
 
 VOLUME /var/lib/docker
 WORKDIR /go/src/github.com/docker/docker
-ENV DOCKER_BUILDTAGS apparmor selinux btrfs_noversion
+ENV DOCKER_BUILDTAGS apparmor selinux
 
 # Let us use a .bashrc file
 RUN ln -sfv $PWD/.bashrc ~/.bashrc
 
+# Register Docker's bash completion.
+RUN ln -sv $PWD/contrib/completion/bash/docker /etc/bash_completion.d/docker
+
 # Get useful and necessary Hub images so we can "docker load" locally instead of pulling
 COPY contrib/download-frozen-image.sh /go/src/github.com/docker/docker/contrib/
 RUN ./contrib/download-frozen-image.sh /docker-frozen-images \
-	busybox:latest@4986bf8c15363d1c5d15512d5266f8777bfba4974ac56e3270e7760f6f0a8125 \
-	hello-world:frozen@e45a5af57b00862e5ef5782a9925979a02ba2b12dff832fd0991335f4a11e5c5
+	busybox:latest@8c2e06607696bd4afb3d03b687e361cc43cf8ec1a4a725bc96e39f05ba97dd55 \
+	hello-world:frozen@91c95931e552b11604fea91c2f537284149ec32fff0f700a4769cfd31d7696ae \
+	jess/unshare@5c9f6ea50341a2a8eb6677527f2bdedbf331ae894a41714fda770fb130f3314d
 # see also "hack/make/.ensure-frozen-images" (which needs to be updated any time this list is)
 
-# Install man page generator
-COPY vendor /go/src/github.com/docker/docker/vendor
-# (copy vendor/ because go-md2man needs golang.org/x/net)
+# Download man page generator
 RUN set -x \
-	&& git clone -b v1.0.1 https://github.com/cpuguy83/go-md2man.git /go/src/github.com/cpuguy83/go-md2man \
-	&& git clone -b v1.2 https://github.com/russross/blackfriday.git /go/src/github.com/russross/blackfriday \
-	&& go install -v github.com/cpuguy83/go-md2man
+	&& export GOPATH="$(mktemp -d)" \
+	&& git clone -b v1.0.3 https://github.com/cpuguy83/go-md2man.git "$GOPATH/src/github.com/cpuguy83/go-md2man" \
+	&& git clone -b v1.2 https://github.com/russross/blackfriday.git "$GOPATH/src/github.com/russross/blackfriday" \
+	&& go get -v -d github.com/cpuguy83/go-md2man \
+	&& go build -v -o /usr/local/bin/go-md2man github.com/cpuguy83/go-md2man \
+	&& rm -rf "$GOPATH"
 
-# install toml validator
+# Download toml validator
 ENV TOMLV_COMMIT 9baf8a8a9f2ed20a8e54160840c492f937eeaf9a
 RUN set -x \
-	&& git clone https://github.com/BurntSushi/toml.git /go/src/github.com/BurntSushi/toml \
-	&& (cd /go/src/github.com/BurntSushi/toml && git checkout -q $TOMLV_COMMIT) \
-	&& go install -v github.com/BurntSushi/toml/cmd/tomlv
+	&& export GOPATH="$(mktemp -d)" \
+	&& git clone https://github.com/BurntSushi/toml.git "$GOPATH/src/github.com/BurntSushi/toml" \
+	&& (cd "$GOPATH/src/github.com/BurntSushi/toml" && git checkout -q "$TOMLV_COMMIT") \
+	&& go build -v -o /usr/local/bin/tomlv github.com/BurntSushi/toml/cmd/tomlv \
+	&& rm -rf "$GOPATH"
+
+# Build/install the tool for embedding resources in Windows binaries
+ENV RSRC_COMMIT e48dbf1b7fc464a9e85fcec450dddf80816b76e0
+RUN set -x \
+    && git clone https://github.com/akavel/rsrc.git /go/src/github.com/akavel/rsrc \
+    && cd /go/src/github.com/akavel/rsrc \
+    && git checkout -q $RSRC_COMMIT \
+    && go install -v
 
 # Wrap all commands in the "docker-in-docker" script to allow nested containers
 ENTRYPOINT ["hack/dind"]

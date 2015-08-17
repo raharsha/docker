@@ -38,7 +38,10 @@ static void	log_with_errno_init()
 */
 import "C"
 
-import "unsafe"
+import (
+	"reflect"
+	"unsafe"
+)
 
 type (
 	CDmTask C.struct_dm_task
@@ -90,28 +93,30 @@ const (
 )
 
 var (
-	DmGetLibraryVersion    = dmGetLibraryVersionFct
-	DmGetNextTarget        = dmGetNextTargetFct
-	DmLogInitVerbose       = dmLogInitVerboseFct
-	DmSetDevDir            = dmSetDevDirFct
-	DmTaskAddTarget        = dmTaskAddTargetFct
-	DmTaskCreate           = dmTaskCreateFct
-	DmTaskDestroy          = dmTaskDestroyFct
-	DmTaskGetDeps          = dmTaskGetDepsFct
-	DmTaskGetInfo          = dmTaskGetInfoFct
-	DmTaskGetDriverVersion = dmTaskGetDriverVersionFct
-	DmTaskRun              = dmTaskRunFct
-	DmTaskSetAddNode       = dmTaskSetAddNodeFct
-	DmTaskSetCookie        = dmTaskSetCookieFct
-	DmTaskSetMessage       = dmTaskSetMessageFct
-	DmTaskSetName          = dmTaskSetNameFct
-	DmTaskSetRo            = dmTaskSetRoFct
-	DmTaskSetSector        = dmTaskSetSectorFct
-	DmUdevWait             = dmUdevWaitFct
-	DmUdevSetSyncSupport   = dmUdevSetSyncSupportFct
-	DmUdevGetSyncSupport   = dmUdevGetSyncSupportFct
-	DmCookieSupported      = dmCookieSupportedFct
-	LogWithErrnoInit       = logWithErrnoInitFct
+	DmGetLibraryVersion       = dmGetLibraryVersionFct
+	DmGetNextTarget           = dmGetNextTargetFct
+	DmLogInitVerbose          = dmLogInitVerboseFct
+	DmSetDevDir               = dmSetDevDirFct
+	DmTaskAddTarget           = dmTaskAddTargetFct
+	DmTaskCreate              = dmTaskCreateFct
+	DmTaskDestroy             = dmTaskDestroyFct
+	DmTaskGetDeps             = dmTaskGetDepsFct
+	DmTaskGetInfo             = dmTaskGetInfoFct
+	DmTaskGetDriverVersion    = dmTaskGetDriverVersionFct
+	DmTaskRun                 = dmTaskRunFct
+	DmTaskSetAddNode          = dmTaskSetAddNodeFct
+	DmTaskSetCookie           = dmTaskSetCookieFct
+	DmTaskSetMessage          = dmTaskSetMessageFct
+	DmTaskSetName             = dmTaskSetNameFct
+	DmTaskSetRo               = dmTaskSetRoFct
+	DmTaskSetSector           = dmTaskSetSectorFct
+	DmUdevWait                = dmUdevWaitFct
+	DmUdevSetSyncSupport      = dmUdevSetSyncSupportFct
+	DmUdevGetSyncSupport      = dmUdevGetSyncSupportFct
+	DmCookieSupported         = dmCookieSupportedFct
+	LogWithErrnoInit          = logWithErrnoInitFct
+	DmTaskDeferredRemove      = dmTaskDeferredRemoveFct
+	DmTaskGetInfoWithDeferred = dmTaskGetInfoWithDeferredFct
 )
 
 func free(p *C.char) {
@@ -182,12 +187,21 @@ func dmTaskGetDepsFct(task *CDmTask) *Deps {
 	if Cdeps == nil {
 		return nil
 	}
+
+	// golang issue: https://github.com/golang/go/issues/11925
+	hdr := reflect.SliceHeader{
+		Data: uintptr(unsafe.Pointer(uintptr(unsafe.Pointer(Cdeps)) + unsafe.Sizeof(*Cdeps))),
+		Len:  int(Cdeps.count),
+		Cap:  int(Cdeps.count),
+	}
+	devices := *(*[]C.uint64_t)(unsafe.Pointer(&hdr))
+
 	deps := &Deps{
 		Count:  uint32(Cdeps.count),
 		Filler: uint32(Cdeps.filler),
 	}
-	for _, device := range Cdeps.device {
-		deps.Device = append(deps.Device, (uint64)(device))
+	for _, device := range devices {
+		deps.Device = append(deps.Device, uint64(device))
 	}
 	return deps
 }
@@ -219,7 +233,7 @@ func dmTaskGetDriverVersionFct(task *CDmTask) string {
 	return C.GoString((*C.char)(buffer))
 }
 
-func dmGetNextTargetFct(task *CDmTask, next uintptr, start, length *uint64, target, params *string) uintptr {
+func dmGetNextTargetFct(task *CDmTask, next unsafe.Pointer, start, length *uint64, target, params *string) unsafe.Pointer {
 	var (
 		Cstart, Clength      C.uint64_t
 		CtargetType, Cparams *C.char
@@ -231,8 +245,8 @@ func dmGetNextTargetFct(task *CDmTask, next uintptr, start, length *uint64, targ
 		*params = C.GoString(Cparams)
 	}()
 
-	nextp := C.dm_get_next_target((*C.struct_dm_task)(task), unsafe.Pointer(next), &Cstart, &Clength, &CtargetType, &Cparams)
-	return uintptr(nextp)
+	nextp := C.dm_get_next_target((*C.struct_dm_task)(task), next, &Cstart, &Clength, &CtargetType, &Cparams)
+	return nextp
 }
 
 func dmUdevSetSyncSupportFct(syncWithUdev int) {

@@ -1,9 +1,11 @@
+// +build linux
+
 package lxc
 
 import (
 	"fmt"
 
-	"github.com/docker/libcontainer/utils"
+	"github.com/opencontainers/runc/libcontainer/utils"
 )
 
 func finalizeNamespace(args *InitArgs) error {

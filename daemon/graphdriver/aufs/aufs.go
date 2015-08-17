@@ -1,20 +1,22 @@
+// +build linux
+
 /*
 
 aufs driver directory structure
 
-.
-├── layers // Metadata of layers
-│   ├── 1
-│   ├── 2
-│   └── 3
-├── diff  // Content of the layer
-│   ├── 1  // Contains layers that need to be mounted for the id
-│   ├── 2
-│   └── 3
-└── mnt    // Mount points for the rw layers to be mounted
-    ├── 1
-    ├── 2
-    └── 3
+  .
+  ├── layers // Metadata of layers
+  │   ├── 1
+  │   ├── 2
+  │   └── 3
+  ├── diff  // Content of the layer
+  │   ├── 1  // Contains layers that need to be mounted for the id
+  │   ├── 2
+  │   └── 3
+  └── mnt    // Mount points for the rw layers to be mounted
+      ├── 1
+      ├── 2
+      └── 3
 
 */
 
@@ -23,6 +25,7 @@ package aufs
 import (
 	"bufio"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
@@ -30,36 +33,44 @@ import (
 	"sync"
 	"syscall"
 
-	log "github.com/Sirupsen/logrus"
+	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/chrootarchive"
-	"github.com/docker/docker/pkg/common"
 	"github.com/docker/docker/pkg/directory"
 	mountpk "github.com/docker/docker/pkg/mount"
-	"github.com/docker/libcontainer/label"
+	"github.com/docker/docker/pkg/stringid"
+	"github.com/opencontainers/runc/libcontainer/label"
 )
 
 var (
+	// ErrAufsNotSupported is returned if aufs is not supported by the host.
 	ErrAufsNotSupported = fmt.Errorf("AUFS was not found in /proc/filesystems")
 	incompatibleFsMagic = []graphdriver.FsMagic{
 		graphdriver.FsMagicBtrfs,
 		graphdriver.FsMagicAufs,
 	}
 	backingFs = "<unknown>"
+
+	enableDirpermLock sync.Once
+	enableDirperm     bool
 )
 
 func init() {
 	graphdriver.Register("aufs", Init)
 }
 
+// Driver contains information about the filesystem mounted.
+// root of the filesystem
+// sync.Mutex to protect against concurrent modifications
+// active maps mount id to the count
 type Driver struct {
 	root       string
 	sync.Mutex // Protects concurrent modification to active
 	active     map[string]int
 }
 
-// New returns a new AUFS driver.
+// Init returns a new AUFS driver.
 // An error is returned if AUFS is not supported.
 func Init(root string, options []string) (graphdriver.Driver, error) {
 
@@ -93,13 +104,8 @@ func Init(root string, options []string) (graphdriver.Driver, error) {
 		active: make(map[string]int),
 	}
 
-	// Create the root aufs driver dir and return
-	// if it already exists
-	// If not populate the dir structure
+	// Create the root aufs driver dir
 	if err := os.MkdirAll(root, 0755); err != nil {
-		if os.IsExist(err) {
-			return a, nil
-		}
 		return nil, err
 	}
 
@@ -107,6 +113,7 @@ func Init(root string, options []string) (graphdriver.Driver, error) {
 		return nil, err
 	}
 
+	// Populate the dir structure
 	for _, p := range paths {
 		if err := os.MkdirAll(path.Join(root, p), 0755); err != nil {
 			return nil, err
@@ -146,13 +153,20 @@ func (*Driver) String() string {
 	return "aufs"
 }
 
+// Status returns current information about the filesystem such as root directory, number of directories mounted, etc.
 func (a *Driver) Status() [][2]string {
 	ids, _ := loadIds(path.Join(a.rootPath(), "layers"))
 	return [][2]string{
 		{"Root Dir", a.rootPath()},
 		{"Backing Filesystem", backingFs},
 		{"Dirs", fmt.Sprintf("%d", len(ids))},
+		{"Dirperm1 Supported", fmt.Sprintf("%v", useDirperm())},
 	}
+}
+
+// GetMetadata not implemented
+func (a *Driver) GetMetadata(id string) (map[string]string, error) {
+	return nil, nil
 }
 
 // Exists returns true if the given id is registered with
@@ -164,7 +178,7 @@ func (a *Driver) Exists(id string) bool {
 	return true
 }
 
-// Three folders are created for each id
+// Create three folders for each id
 // mnt, layers, and diff
 func (a *Driver) Create(id, parent string) error {
 	if err := a.createDirsFor(id); err != nil {
@@ -209,14 +223,14 @@ func (a *Driver) createDirsFor(id string) error {
 	return nil
 }
 
-// Unmount and remove the dir information
+// Remove will unmount and remove the given id.
 func (a *Driver) Remove(id string) error {
 	// Protect the a.active from concurrent access
 	a.Lock()
 	defer a.Unlock()
 
 	if a.active[id] != 0 {
-		log.Errorf("Removing active id %s", id)
+		logrus.Errorf("Removing active id %s", id)
 	}
 
 	// Make sure the dir is umounted first
@@ -248,7 +262,7 @@ func (a *Driver) Remove(id string) error {
 	return nil
 }
 
-// Return the rootfs path for the id
+// Get returns the rootfs path for the id.
 // This will mount the dir at it's given path
 func (a *Driver) Get(id, mountLabel string) (string, error) {
 	ids, err := getParentIds(a.rootPath(), id)
@@ -283,6 +297,7 @@ func (a *Driver) Get(id, mountLabel string) (string, error) {
 	return out, nil
 }
 
+// Put unmounts and updates list of active mounts.
 func (a *Driver) Put(id string) error {
 	// Protect the a.active from concurrent access
 	a.Lock()
@@ -311,8 +326,8 @@ func (a *Driver) Diff(id, parent string) (archive.Archive, error) {
 	})
 }
 
-func (a *Driver) applyDiff(id string, diff archive.ArchiveReader) error {
-	return chrootarchive.Untar(diff, path.Join(a.rootPath(), "diff", id), nil)
+func (a *Driver) applyDiff(id string, diff archive.Reader) error {
+	return chrootarchive.UntarUncompressed(diff, path.Join(a.rootPath(), "diff", id), nil)
 }
 
 // DiffSize calculates the changes between the specified id
@@ -326,7 +341,7 @@ func (a *Driver) DiffSize(id, parent string) (size int64, err error) {
 // ApplyDiff extracts the changeset from the given diff into the
 // layer with the specified id and parent, returning the size of the
 // new layer in bytes.
-func (a *Driver) ApplyDiff(id, parent string, diff archive.ArchiveReader) (size int64, err error) {
+func (a *Driver) ApplyDiff(id, parent string, diff archive.Reader) (size int64, err error) {
 	// AUFS doesn't need the parent id to apply the diff.
 	if err = a.applyDiff(id, diff); err != nil {
 		return
@@ -396,7 +411,7 @@ func (a *Driver) mounted(id string) (bool, error) {
 	return mountpk.Mounted(target)
 }
 
-// During cleanup aufs needs to unmount all mountpoints
+// Cleanup aufs and unmount all mountpoints
 func (a *Driver) Cleanup() error {
 	ids, err := loadIds(path.Join(a.rootPath(), "layers"))
 	if err != nil {
@@ -405,7 +420,7 @@ func (a *Driver) Cleanup() error {
 
 	for _, id := range ids {
 		if err := a.unmount(id); err != nil {
-			log.Errorf("Unmounting %s: %s", common.TruncateID(id), err)
+			logrus.Errorf("Unmounting %s: %s", stringid.TruncateID(id), err)
 		}
 	}
 
@@ -422,7 +437,11 @@ func (a *Driver) aufsMount(ro []string, rw, target, mountLabel string) (err erro
 	// Mount options are clipped to page size(4096 bytes). If there are more
 	// layers then these are remounted individually using append.
 
-	b := make([]byte, syscall.Getpagesize()-len(mountLabel)-54) // room for xino & mountLabel
+	offset := 54
+	if useDirperm() {
+		offset += len("dirperm1")
+	}
+	b := make([]byte, syscall.Getpagesize()-len(mountLabel)-offset) // room for xino & mountLabel
 	bp := copy(b, fmt.Sprintf("br:%s=rw", rw))
 
 	firstMount := true
@@ -439,14 +458,18 @@ func (a *Driver) aufsMount(ro []string, rw, target, mountLabel string) (err erro
 				bp += copy(b[bp:], layer)
 			} else {
 				data := label.FormatMountLabel(fmt.Sprintf("append%s", layer), mountLabel)
-				if err = mount("none", target, "aufs", MsRemount, data); err != nil {
+				if err = mount("none", target, "aufs", syscall.MS_REMOUNT, data); err != nil {
 					return
 				}
 			}
 		}
 
 		if firstMount {
-			data := label.FormatMountLabel(fmt.Sprintf("%s,dio,xino=/dev/shm/aufs.xino", string(b[:bp])), mountLabel)
+			opts := "dio,xino=/dev/shm/aufs.xino"
+			if useDirperm() {
+				opts += ",dirperm1"
+			}
+			data := label.FormatMountLabel(fmt.Sprintf("%s,%s", string(b[:bp]), opts), mountLabel)
 			if err = mount("none", target, "aufs", 0, data); err != nil {
 				return
 			}
@@ -459,4 +482,34 @@ func (a *Driver) aufsMount(ro []string, rw, target, mountLabel string) (err erro
 	}
 
 	return
+}
+
+// useDirperm checks dirperm1 mount option can be used with the current
+// version of aufs.
+func useDirperm() bool {
+	enableDirpermLock.Do(func() {
+		base, err := ioutil.TempDir("", "docker-aufs-base")
+		if err != nil {
+			logrus.Errorf("error checking dirperm1: %v", err)
+			return
+		}
+		defer os.RemoveAll(base)
+
+		union, err := ioutil.TempDir("", "docker-aufs-union")
+		if err != nil {
+			logrus.Errorf("error checking dirperm1: %v", err)
+			return
+		}
+		defer os.RemoveAll(union)
+
+		opts := fmt.Sprintf("br:%s,dirperm1,xino=/dev/shm/aufs.xino", base)
+		if err := mount("none", union, "aufs", 0, opts); err != nil {
+			return
+		}
+		enableDirperm = true
+		if err := Unmount(union); err != nil {
+			logrus.Errorf("error checking dirperm1: failed to unmount %v", err)
+		}
+	})
+	return enableDirperm
 }

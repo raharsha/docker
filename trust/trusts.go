@@ -3,6 +3,7 @@ package trust
 import (
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -12,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
+	"github.com/Sirupsen/logrus"
 	"github.com/docker/libtrust/trustgraph"
 )
 
@@ -62,8 +63,7 @@ func NewTrustStore(path string) (*TrustStore, error) {
 		baseEndpoints: endpoints,
 	}
 
-	err = t.reload()
-	if err != nil {
+	if err := t.reload(); err != nil {
 		return nil, err
 	}
 
@@ -82,18 +82,18 @@ func (t *TrustStore) reload() error {
 	for i, match := range matches {
 		f, err := os.Open(match)
 		if err != nil {
-			return err
+			return fmt.Errorf("Error opening %q: %s", match, err)
 		}
 		statements[i], err = trustgraph.LoadStatement(f, nil)
 		if err != nil {
 			f.Close()
-			return err
+			return fmt.Errorf("Error loading %q: %s", match, err)
 		}
 		f.Close()
 	}
 	if len(statements) == 0 {
 		if t.autofetch {
-			log.Debugf("No grants, fetching")
+			logrus.Debugf("No grants, fetching")
 			t.fetcher = time.AfterFunc(t.fetchTime, t.fetch)
 		}
 		return nil
@@ -106,7 +106,7 @@ func (t *TrustStore) reload() error {
 
 	t.expiration = expiration
 	t.graph = trustgraph.NewMemoryGraph(grants)
-	log.Debugf("Reloaded graph with %d grants expiring at %s", len(grants), expiration)
+	logrus.Debugf("Reloaded graph with %d grants expiring at %s", len(grants), expiration)
 
 	if t.autofetch {
 		nextFetch := expiration.Sub(time.Now())
@@ -161,28 +161,26 @@ func (t *TrustStore) fetch() {
 	for bg, ep := range t.baseEndpoints {
 		statement, err := t.fetchBaseGraph(ep)
 		if err != nil {
-			log.Infof("Trust graph fetch failed: %s", err)
+			logrus.Infof("Trust graph fetch failed: %s", err)
 			continue
 		}
 		b, err := statement.Bytes()
 		if err != nil {
-			log.Infof("Bad trust graph statement: %s", err)
+			logrus.Infof("Bad trust graph statement: %s", err)
 			continue
 		}
 		// TODO check if value differs
-		err = ioutil.WriteFile(path.Join(t.path, bg+".json"), b, 0600)
-		if err != nil {
-			log.Infof("Error writing trust graph statement: %s", err)
+		if err := ioutil.WriteFile(path.Join(t.path, bg+".json"), b, 0600); err != nil {
+			logrus.Infof("Error writing trust graph statement: %s", err)
 		}
 		fetchCount++
 	}
-	log.Debugf("Fetched %d base graphs at %s", fetchCount, time.Now())
+	logrus.Debugf("Fetched %d base graphs at %s", fetchCount, time.Now())
 
 	if fetchCount > 0 {
 		go func() {
-			err := t.reload()
-			if err != nil {
-				log.Infof("Reload of trust graph failed: %s", err)
+			if err := t.reload(); err != nil {
+				logrus.Infof("Reload of trust graph failed: %s", err)
 			}
 		}()
 		t.fetchTime = defaultFetchtime

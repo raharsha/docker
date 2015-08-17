@@ -2,71 +2,41 @@ package daemon
 
 import (
 	"fmt"
-	"strings"
 
-	"github.com/docker/docker/engine"
-	"github.com/docker/docker/graph"
+	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/graph/tags"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/pkg/parsers"
 	"github.com/docker/docker/runconfig"
-	"github.com/docker/libcontainer/label"
+	"github.com/opencontainers/runc/libcontainer/label"
 )
 
-func (daemon *Daemon) ContainerCreate(job *engine.Job) engine.Status {
-	var name string
-	if len(job.Args) == 1 {
-		name = job.Args[0]
-	} else if len(job.Args) > 1 {
-		return job.Errorf("Usage: %s", job.Name)
+func (daemon *Daemon) ContainerCreate(name string, config *runconfig.Config, hostConfig *runconfig.HostConfig, adjustCPUShares bool) (string, []string, error) {
+	if config == nil {
+		return "", nil, fmt.Errorf("Config cannot be empty in order to create a container")
 	}
 
-	config := runconfig.ContainerConfigFromJob(job)
-	hostConfig := runconfig.ContainerHostConfigFromJob(job)
-
-	if len(hostConfig.LxcConf) > 0 && !strings.Contains(daemon.ExecutionDriver().Name(), "lxc") {
-		return job.Errorf("Cannot use --lxc-conf with execdriver: %s", daemon.ExecutionDriver().Name())
-	}
-	if hostConfig.Memory != 0 && hostConfig.Memory < 4194304 {
-		return job.Errorf("Minimum memory limit allowed is 4MB")
-	}
-	if hostConfig.Memory > 0 && !daemon.SystemConfig().MemoryLimit {
-		job.Errorf("Your kernel does not support memory limit capabilities. Limitation discarded.\n")
-		hostConfig.Memory = 0
-	}
-	if hostConfig.Memory > 0 && hostConfig.MemorySwap != -1 && !daemon.SystemConfig().SwapLimit {
-		job.Errorf("Your kernel does not support swap limit capabilities. Limitation discarded.\n")
-		hostConfig.MemorySwap = -1
-	}
-	if hostConfig.Memory > 0 && hostConfig.MemorySwap > 0 && hostConfig.MemorySwap < hostConfig.Memory {
-		return job.Errorf("Minimum memoryswap limit should be larger than memory limit, see usage.\n")
-	}
-	if hostConfig.Memory == 0 && hostConfig.MemorySwap > 0 {
-		return job.Errorf("You should always set the Memory limit when using Memoryswap limit, see usage.\n")
+	warnings, err := daemon.verifyContainerSettings(hostConfig, config)
+	daemon.adaptContainerSettings(hostConfig, adjustCPUShares)
+	if err != nil {
+		return "", warnings, err
 	}
 
 	container, buildWarnings, err := daemon.Create(config, hostConfig, name)
 	if err != nil {
-		if daemon.Graph().IsNotExist(err) {
+		if daemon.Graph().IsNotExist(err, config.Image) {
 			_, tag := parsers.ParseRepositoryTag(config.Image)
 			if tag == "" {
-				tag = graph.DEFAULTTAG
+				tag = tags.DefaultTag
 			}
-			return job.Errorf("No such image: %s (tag: %s)", config.Image, tag)
+			return "", warnings, fmt.Errorf("No such image: %s (tag: %s)", config.Image, tag)
 		}
-		return job.Error(err)
-	}
-	if !container.Config.NetworkDisabled && daemon.SystemConfig().IPv4ForwardingDisabled {
-		job.Errorf("IPv4 forwarding is disabled.\n")
-	}
-	container.LogEvent("create")
-
-	job.Printf("%s\n", container.ID)
-
-	for _, warning := range buildWarnings {
-		job.Errorf("%s\n", warning)
+		return "", warnings, err
 	}
 
-	return engine.StatusOK
+	warnings = append(warnings, buildWarnings...)
+
+	return container.ID, warnings, nil
 }
 
 // Create creates a new container from the given configuration with a given name.
@@ -84,13 +54,13 @@ func (daemon *Daemon) Create(config *runconfig.Config, hostConfig *runconfig.Hos
 		if err != nil {
 			return nil, nil, err
 		}
-		if err = img.CheckDepth(); err != nil {
+		if err = daemon.graph.CheckDepth(img); err != nil {
 			return nil, nil, err
 		}
 		imgID = img.ID
 	}
 
-	if warnings, err = daemon.mergeAndVerifyConfig(config, img); err != nil {
+	if err := daemon.mergeAndVerifyConfig(config, img); err != nil {
 		return nil, nil, err
 	}
 	if hostConfig == nil {
@@ -111,21 +81,23 @@ func (daemon *Daemon) Create(config *runconfig.Config, hostConfig *runconfig.Hos
 	if err := daemon.createRootfs(container); err != nil {
 		return nil, nil, err
 	}
-	if hostConfig != nil {
-		if err := daemon.setHostConfig(container, hostConfig); err != nil {
-			return nil, nil, err
-		}
+	if err := daemon.setHostConfig(container, hostConfig); err != nil {
+		return nil, nil, err
 	}
 	if err := container.Mount(); err != nil {
 		return nil, nil, err
 	}
 	defer container.Unmount()
-	if err := container.prepareVolumes(); err != nil {
+
+	if err := createContainerPlatformSpecificSettings(container, config); err != nil {
 		return nil, nil, err
 	}
+
 	if err := container.ToDisk(); err != nil {
+		logrus.Errorf("Error saving new container to disk: %v", err)
 		return nil, nil, err
 	}
+	container.LogEvent("create")
 	return container, warnings, nil
 }
 
@@ -137,9 +109,6 @@ func (daemon *Daemon) GenerateSecurityOpt(ipcMode runconfig.IpcMode, pidMode run
 		c, err := daemon.Get(ipcContainer)
 		if err != nil {
 			return nil, err
-		}
-		if !c.IsRunning() {
-			return nil, fmt.Errorf("cannot join IPC of a non running container: %s", ipcContainer)
 		}
 
 		return label.DupSecOpt(c.ProcessLabel), nil

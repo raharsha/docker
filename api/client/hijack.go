@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
+	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api"
 	"github.com/docker/docker/autogen/dockerversion"
 	"github.com/docker/docker/pkg/promise"
@@ -138,11 +138,18 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(method, fmt.Sprintf("/v%s%s", api.APIVERSION, path), params)
+	req, err := http.NewRequest(method, fmt.Sprintf("%s/v%s%s", cli.basePath, api.Version, path), params)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "Docker-Client/"+dockerversion.VERSION)
+
+	// Add CLI Config's HTTP Headers BEFORE we set the Docker headers
+	// then the user can't change OUR headers
+	for k, v := range cli.configFile.HTTPHeaders {
+		req.Header.Set(k, v)
+	}
+
+	req.Header.Set("User-Agent", "Docker-Client/"+dockerversion.VERSION+" ("+runtime.GOOS+")")
 	req.Header.Set("Content-Type", "text/plain")
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "tcp")
@@ -160,7 +167,7 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 	}
 	if err != nil {
 		if strings.Contains(err.Error(), "connection refused") {
-			return fmt.Errorf("Cannot connect to the Docker daemon. Is 'docker -d' running on this host?")
+			return fmt.Errorf("Cannot connect to the Docker daemon. Is 'docker daemon' running on this host?")
 		}
 		return err
 	}
@@ -211,7 +218,7 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 			} else {
 				_, err = stdcopy.StdCopy(stdout, stderr, br)
 			}
-			log.Debugf("[hijack] End of stdout")
+			logrus.Debugf("[hijack] End of stdout")
 			return err
 		})
 	}
@@ -219,14 +226,14 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 	sendStdin := promise.Go(func() error {
 		if in != nil {
 			io.Copy(rwc, in)
-			log.Debugf("[hijack] End of stdin")
+			logrus.Debugf("[hijack] End of stdin")
 		}
 
 		if conn, ok := rwc.(interface {
 			CloseWrite() error
 		}); ok {
 			if err := conn.CloseWrite(); err != nil {
-				log.Debugf("Couldn't send EOF: %s", err)
+				logrus.Debugf("Couldn't send EOF: %s", err)
 			}
 		}
 		// Discard errors due to pipe interruption
@@ -235,14 +242,14 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 
 	if stdout != nil || stderr != nil {
 		if err := <-receiveStdout; err != nil {
-			log.Debugf("Error receiveStdout: %s", err)
+			logrus.Debugf("Error receiveStdout: %s", err)
 			return err
 		}
 	}
 
 	if !cli.isTerminalIn {
 		if err := <-sendStdin; err != nil {
-			log.Debugf("Error sendStdin: %s", err)
+			logrus.Debugf("Error sendStdin: %s", err)
 			return err
 		}
 	}

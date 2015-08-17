@@ -3,34 +3,40 @@ package api
 import (
 	"fmt"
 	"mime"
-	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
-	log "github.com/Sirupsen/logrus"
-	"github.com/docker/docker/engine"
-	"github.com/docker/docker/pkg/parsers"
+	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/pkg/version"
 	"github.com/docker/libtrust"
 )
 
+// Common constants for daemon and client.
 const (
-	APIVERSION            version.Version = "1.18"
-	DEFAULTHTTPHOST                       = "127.0.0.1"
-	DEFAULTUNIXSOCKET                     = "/var/run/docker.sock"
-	DefaultDockerfileName string          = "Dockerfile"
+	// Version of Current REST API
+	Version version.Version = "1.21"
+
+	// MinVersion represents Minimun REST API version supported
+	MinVersion version.Version = "1.12"
+
+	// DefaultDockerfileName is the Default filename with Docker commands, read by docker build
+	DefaultDockerfileName string = "Dockerfile"
 )
 
-func ValidateHost(val string) (string, error) {
-	host, err := parsers.ParseHost(DEFAULTHTTPHOST, DEFAULTUNIXSOCKET, val)
-	if err != nil {
-		return val, err
-	}
-	return host, nil
-}
+// byPrivatePort is temporary type used to sort types.Port by PrivatePort
+type byPrivatePort []types.Port
 
-// TODO remove, used on < 1.5 in getContainersJSON
-func DisplayablePorts(ports *engine.Table) string {
+func (r byPrivatePort) Len() int           { return len(r) }
+func (r byPrivatePort) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
+func (r byPrivatePort) Less(i, j int) bool { return r[i].PrivatePort < r[j].PrivatePort }
+
+// DisplayablePorts returns formatted string representing open ports of container
+// e.g. "0.0.0.0:80->9090/tcp, 9988/tcp"
+// it's used by command 'docker ps'
+func DisplayablePorts(ports []types.Port) string {
 	var (
 		result          = []string{}
 		hostMappings    = []string{}
@@ -39,21 +45,20 @@ func DisplayablePorts(ports *engine.Table) string {
 	)
 	firstInGroupMap = make(map[string]int)
 	lastInGroupMap = make(map[string]int)
-	ports.SetKey("PrivatePort")
-	ports.Sort()
-	for _, port := range ports.Data {
+	sort.Sort(byPrivatePort(ports))
+	for _, port := range ports {
 		var (
-			current      = port.GetInt("PrivatePort")
-			portKey      = port.Get("Type")
+			current      = port.PrivatePort
+			portKey      = port.Type
 			firstInGroup int
 			lastInGroup  int
 		)
-		if port.Get("IP") != "" {
-			if port.GetInt("PublicPort") != current {
-				hostMappings = append(hostMappings, fmt.Sprintf("%s:%d->%d/%s", port.Get("IP"), port.GetInt("PublicPort"), port.GetInt("PrivatePort"), port.Get("Type")))
+		if port.IP != "" {
+			if port.PublicPort != current {
+				hostMappings = append(hostMappings, fmt.Sprintf("%s:%d->%d/%s", port.IP, port.PublicPort, port.PrivatePort, port.Type))
 				continue
 			}
-			portKey = fmt.Sprintf("%s/%s", port.Get("IP"), port.Get("Type"))
+			portKey = fmt.Sprintf("%s/%s", port.IP, port.Type)
 		}
 		firstInGroup = firstInGroupMap[portKey]
 		lastInGroup = lastInGroupMap[portKey]
@@ -68,18 +73,18 @@ func DisplayablePorts(ports *engine.Table) string {
 			lastInGroupMap[portKey] = current
 			continue
 		}
-		result = append(result, FormGroup(portKey, firstInGroup, lastInGroup))
+		result = append(result, formGroup(portKey, firstInGroup, lastInGroup))
 		firstInGroupMap[portKey] = current
 		lastInGroupMap[portKey] = current
 	}
 	for portKey, firstInGroup := range firstInGroupMap {
-		result = append(result, FormGroup(portKey, firstInGroup, lastInGroupMap[portKey]))
+		result = append(result, formGroup(portKey, firstInGroup, lastInGroupMap[portKey]))
 	}
 	result = append(result, hostMappings...)
 	return strings.Join(result, ", ")
 }
 
-func FormGroup(key string, start, last int) string {
+func formGroup(key string, start, last int) string {
 	var (
 		group     string
 		parts     = strings.Split(key, "/")
@@ -101,10 +106,11 @@ func FormGroup(key string, start, last int) string {
 	return fmt.Sprintf("%s/%s", group, groupType)
 }
 
+// MatchesContentType validates the content type against the expected one
 func MatchesContentType(contentType, expectedType string) bool {
 	mimetype, _, err := mime.ParseMediaType(contentType)
 	if err != nil {
-		log.Errorf("Error parsing media type: %s error: %v", contentType, err)
+		logrus.Errorf("Error parsing media type: %s error: %v", contentType, err)
 	}
 	return err == nil && mimetype == expectedType
 }
@@ -112,7 +118,7 @@ func MatchesContentType(contentType, expectedType string) bool {
 // LoadOrCreateTrustKey attempts to load the libtrust key at the given path,
 // otherwise generates a new one
 func LoadOrCreateTrustKey(trustKeyPath string) (libtrust.PrivateKey, error) {
-	err := os.MkdirAll(filepath.Dir(trustKeyPath), 0700)
+	err := system.MkdirAll(filepath.Dir(trustKeyPath), 0700)
 	if err != nil {
 		return nil, err
 	}

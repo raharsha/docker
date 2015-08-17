@@ -3,29 +3,62 @@
 package server
 
 import (
-	"fmt"
+	"errors"
+	"net"
+	"net/http"
 
-	"github.com/docker/docker/engine"
+	"github.com/docker/docker/daemon"
 )
 
 // NewServer sets up the required Server and does protocol specific checking.
-func NewServer(proto, addr string, job *engine.Job) (Server, error) {
-	// Basic error and sanity checking
+func (s *Server) newServer(proto, addr string) ([]serverCloser, error) {
+	var (
+		ls []net.Listener
+	)
 	switch proto {
 	case "tcp":
-		return setupTcpHttp(addr, job)
+		l, err := s.initTCPSocket(addr)
+		if err != nil {
+			return nil, err
+		}
+		ls = append(ls, l)
+
 	default:
 		return nil, errors.New("Invalid protocol format. Windows only supports tcp.")
 	}
+
+	var res []serverCloser
+	for _, l := range ls {
+		res = append(res, &HTTPServer{
+			&http.Server{
+				Addr:    addr,
+				Handler: s.router,
+			},
+			l,
+		})
+	}
+	return res, nil
+
 }
 
-// Called through eng.Job("acceptconnections")
-func AcceptConnections(job *engine.Job) engine.Status {
-
+// AcceptConnections allows router to start listening for the incoming requests.
+func (s *Server) AcceptConnections(d *daemon.Daemon) {
+	s.daemon = d
+	s.registerSubRouter()
 	// close the lock so the listeners start accepting connections
-	if activationLock != nil {
-		close(activationLock)
+	select {
+	case <-s.start:
+	default:
+		close(s.start)
 	}
+}
 
-	return engine.StatusOK
+func allocateDaemonPort(addr string) error {
+	return nil
+}
+
+// getContainersByNameDownlevel performs processing for pre 1.20 APIs. This
+// is only relevant on non-Windows daemons.
+func getContainersByNameDownlevel(w http.ResponseWriter, s *Server, namevar string) error {
+	return nil
 }
